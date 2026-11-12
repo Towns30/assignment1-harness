@@ -16,7 +16,7 @@ What the wrapper does for you:
   the sampling settings, and the exact messages. Re-running unchanged code
   costs nothing.
 * Cost ledger. Every call that reaches the provider is appended to
-  ``.lm_cache/ledger.jsonl`` with its token counts and dollar cost.
+  ``.lm_cache/ledger.jsonl`` with its token counts and estimated dollar cost (peak rates).
   ``uv run python -m cs329z_hw1.llm`` prints a spending report.
 * Budget stop. If ``CS329Z_BUDGET_USD`` is set, the wrapper raises
   ``BudgetExceeded`` instead of making a call once the ledger total passes it.
@@ -44,46 +44,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 Message = dict  # {"role": "system" | "user" | "assistant", "content": str}
 
-# Model used for each role. Override any of these with the environment
-# variable CS329Z_<ROLE>_MODEL, e.g. CS329Z_GRADING_MODEL.
+# Override each role with CS329Z_<ROLE>_MODEL.
 DEFAULT_MODELS = {
-    "grading": "openai/gpt-6-luna",  # the model your agent is graded with
-    "user": "openai/gpt-6-luna",  # plays the simulated users
-    "judge": "openai/gpt-6-sol",  # scores evaluation transcripts
+    "grading": "deepseek-flash",  # the student's agent and pipelines
+    "user": "deepseek-flash",  # plays the simulated users
+    "judge": "deepseek-v4-pro",  # scores evaluation transcripts
 }
 
-# Calls go to OpenRouter, which fronts many providers behind one
-# OpenAI-compatible API. Model names carry the provider as a prefix
-# ("openai/gpt-6-luna"); https://openrouter.ai/models lists them.
-OPENROUTER_URL = "https://openrouter.ai/api/v1"
+DEEPSEEK_URL = "https://api.deepseek.com"
 
-# Reasoning effort requested from models that accept it (GPT-5 and GPT-6).
-# Override with CS329Z_REASONING_EFFORT.
-DEFAULT_REASONING_EFFORT = "low"
-
-# USD per 1M tokens: (input, cached input, output), keyed by the model name
-# without its provider prefix. OpenRouter reports the exact cost of each
-# call in the response, and the ledger records that; this table is the
-# fallback for a response without one, and it is checked when an LM is
-# created so that an unknown model fails before a paid call. Read from
-# https://openrouter.ai/models on 2026-10-05 (the same as OpenAI's list
-# prices).
+# USD per 1M tokens: (input, cached input, output).
+# Conservative estimates using peak rates, checked 2026-11-12:
+# https://api-docs.deepseek.com/quick_start/pricing/
+# Off-peak rates are lower; the provider's bill is authoritative.
 PRICES = {
-    "gpt-4.1": (2.00, 0.50, 8.00),
-    "gpt-4.1-mini": (0.40, 0.10, 1.60),
-    "gpt-4.1-nano": (0.10, 0.025, 0.40),
-    "gpt-4o-mini": (0.15, 0.075, 0.60),
-    "gpt-5-mini": (0.25, 0.025, 2.00),
-    "gpt-5-nano": (0.05, 0.005, 0.40),
-    "gpt-5.4": (2.50, 0.25, 15.00),
-    "gpt-5.4-mini": (0.75, 0.075, 4.50),
-    "gpt-5.4-nano": (0.20, 0.02, 1.25),
-    "gpt-5.6-luna": (0.20, 0.02, 1.20),
-    "gpt-5.6-terra": (2.00, 0.20, 12.00),
-    "gpt-6-astra": (10.00, 1.00, 50.00),
-    "gpt-5.5": (5.00, 0.50, 30.00),
-    "gpt-6-luna": (0.10, 0.01, 0.50),
-    "gpt-6-sol": (2.00, 0.20, 10.00),
+    "deepseek-flash": (0.30, 0.006, 1.20),
+    "deepseek-v4-pro": (1.32, 0.044, 3.96),
 }
 
 VALID_ROLES = ("system", "user", "assistant")
@@ -135,17 +111,12 @@ def resolve_model(role_or_model: str | None = None) -> str:
 
 
 def _price(model: str) -> tuple[float, float, float]:
-    model = model.rsplit("/", 1)[-1]  # "openai/gpt-6-luna" -> "gpt-6-luna"
-    best = None
-    for prefix, price in PRICES.items():
-        if model == prefix or model.startswith(prefix + "-20"):
-            if best is None or len(prefix) > len(best[0]):
-                best = (prefix, price)
-    if best is None:
+    try:
+        return PRICES[model]
+    except KeyError:
         raise KeyError(
             f"No price on file for model {model!r}. Add it to PRICES in cs329z_hw1/llm.py."
-        )
-    return best[1]
+        ) from None
 
 
 def cost_usd(model: str, input_tokens: int, cached_tokens: int, output_tokens: int) -> float:
@@ -167,10 +138,6 @@ def _load_env() -> None:
 
 
 _ledger_lock = threading.Lock()
-# Models that reject the temperature or reasoning_effort parameters, learned
-# from the provider's error the first time each is used.
-_NO_TEMPERATURE: set[str] = set()
-_NO_EFFORT: set[str] = set()
 
 
 def read_ledger() -> list[dict]:
@@ -220,12 +187,11 @@ class LM:
     Parameters
     ----------
     model:
-        A role ("grading", "user", "judge"), an OpenRouter model name such
-        as "openai/gpt-6-sol", or ``None`` for "grading".
+        A role ("grading", "user", "judge"), a DeepSeek model name such
+        as "deepseek-flash", or ``None`` for "grading".
     temperature, max_tokens:
-        Sampling settings. They are part of the cache key. Reasoning models
-        spend part of ``max_tokens`` on hidden reasoning, so keep it large.
-        Models that reject ``temperature`` are called without it.
+        Sampling settings. They are part of the cache key. Thinking mode is
+        explicitly disabled for all roles.
     tag:
         A free-form label written to the cost ledger so spending can be
         grouped (the test suite sets it to the test name).
@@ -330,9 +296,8 @@ class LM:
     # -- internals --------------------------------------------------------
 
     def _key(self, messages: list[Message]) -> str:
-        effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
         blob = json.dumps(
-            [self.model, self.temperature, self.max_tokens, effort, self.salt, messages],
+            [DEEPSEEK_URL, "thinking-disabled", self.model, self.temperature, self.max_tokens, self.salt, messages],
             sort_keys=True,
             ensure_ascii=False,
         )
@@ -353,50 +318,32 @@ class LM:
         if self._client is None:
             from openai import OpenAI
 
-            key = os.environ.get("OPENROUTER_API_KEY")
+            key = os.environ.get("DEEPSEEK_API_KEY")
             if not key:
                 raise RuntimeError(
-                    "OPENROUTER_API_KEY is not set. Copy .env.example to .env and add your key."
+                    "DEEPSEEK_API_KEY is not set. Copy .env.example to .env and add your key."
                 )
             self._client = OpenAI(
-                base_url=OPENROUTER_URL,
+                base_url=DEEPSEEK_URL,
                 api_key=key,
                 max_retries=6,
                 timeout=120,
-                default_headers={"X-Title": "CS329Z HW1"},
             )
-        kwargs: dict = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": self.max_tokens,
-            # OpenRouter extensions: the reasoning effort, and the request
-            # that the response carry the cost of the call.
-            "extra_body": {"usage": {"include": True}},
-        }
-        if self.model not in _NO_TEMPERATURE:
-            kwargs["temperature"] = self.temperature
-        effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
-        if effort and self.model not in _NO_EFFORT:
-            kwargs["extra_body"]["reasoning"] = {"effort": effort}
-        try:
-            response = self._client.chat.completions.create(**kwargs)
-        except Exception as exc:  # some models reject temperature or reasoning effort
-            text = str(exc)
-            if "temperature" in text and "temperature" in kwargs:
-                _NO_TEMPERATURE.add(self.model)
-                kwargs.pop("temperature")
-                response = self._client.chat.completions.create(**kwargs)
-            elif "reasoning" in text and "reasoning" in kwargs["extra_body"]:
-                _NO_EFFORT.add(self.model)
-                kwargs["extra_body"].pop("reasoning")
-                response = self._client.chat.completions.create(**kwargs)
-            else:
-                raise
+        response = self._client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
         choice = response.choices[0]
         text = choice.message.content or ""
         u = response.usage
         details = getattr(u, "prompt_tokens_details", None)
-        cached = getattr(details, "cached_tokens", 0) or 0
+        cached = getattr(u, "prompt_cache_hit_tokens", None)
+        if cached is None:
+            cached = getattr(details, "cached_tokens", 0)
+        cached = cached or 0
         out_details = getattr(u, "completion_tokens_details", None)
         reasoning = getattr(out_details, "reasoning_tokens", 0) or 0
         usage = {
@@ -406,9 +353,6 @@ class LM:
             "reasoning": reasoning,
             "finish_reason": getattr(choice, "finish_reason", None),
         }
-        cost = getattr(u, "cost", None)  # OpenRouter's figure for this call
-        if isinstance(cost, (int, float)):
-            usage["cost"] = float(cost)
         return text, usage
 
 
@@ -504,7 +448,7 @@ def spending_report(rows: list[dict] | None = None) -> str:
             agg["out"] += row.get("output_tokens", 0)
             agg["usd"] += row.get("cost_usd", 0.0)
             agg["sec"] += row.get("seconds", 0.0)
-    lines = []
+    lines = ["Costs are estimates at DeepSeek peak rates; see your provider bill."]
     for title, table in (("By model", by_model), ("By tag and model", by_tag)):
         lines.append(title)
         lines.append(f"  {'name':<72}{'calls':>7}{'cut':>5}{'in tok':>12}{'out tok':>10}{'USD':>9}{'sec':>8}")
@@ -521,4 +465,17 @@ def spending_report(rows: list[dict] | None = None) -> str:
 
 
 if __name__ == "__main__":  # uv run python -m cs329z_hw1.llm
-    print(spending_report())
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DeepSeek spending estimates and connection check")
+    parser.add_argument("--check", action="store_true", help="make one small paid call per model role")
+    args = parser.parse_args()
+    if args.check:
+        for role in DEFAULT_MODELS:
+            lm = LM(role, max_tokens=64, tag="connection_check", cache=False)
+            reply = lm([{"role": "user", "content": "Reply with just OK."}])
+            if not reply.strip():
+                raise RuntimeError(f"{role} ({lm.model}) returned an empty reply")
+            print(f"{role} ({lm.model}): {reply.strip()}")
+    else:
+        print(spending_report())

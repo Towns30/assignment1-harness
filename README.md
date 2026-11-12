@@ -2,7 +2,10 @@
 
 # CS329Z Assignment 1: Building an Agent Harness
 
-This is the starter repository for Assignment 1.
+This is the DeepSeek student edition of the starter repository for Assignment 1.
+The assignment interfaces and student implementation stubs are unchanged.
+For model setup, follow this README; any original model/provider references
+in the handout are superseded by this edition.
 
 **Start by reading the handout, [`cs329z_assignment1_harness.pdf`](cs329z_assignment1_harness.pdf), in this directory.**
 It states every problem, what is graded, and the design decisions that
@@ -28,8 +31,18 @@ where things are.
    cp .env.example .env
    ```
 
-   Open `.env` and fill in `OPENROUTER_API_KEY`. The file is gitignored. Do not
-   commit it.
+   Open `.env` and fill in `DEEPSEEK_API_KEY`. The file is gitignored. Do not
+   commit it. Use a key from https://platform.deepseek.com/ and ensure the
+   account has sufficient balance. No OpenRouter account is needed.
+
+   Optionally check the connection before implementing any assignment code:
+
+   ```sh
+   uv run python -m cs329z_hw1.llm --check
+   ```
+
+   This makes three small **paid** calls (one per role), bypassing the local
+   cache, and records their estimated costs in the ledger.
 
 
 3. Unpack the email archive. It ships in the repository as
@@ -40,7 +53,7 @@ where things are.
    uv run python data/download.py
    ```
 
-4. Run the tests. In the starter, every test fails with `NotImplementedError`:
+4. Run the tests. The assignment tests initially fail with `NotImplementedError` until you implement the stubs:
 
    ```sh
    uv run pytest
@@ -63,7 +76,9 @@ uv run pytest tests/test_priority.py   # one problem
 ```
 
 **Live tests** call the real model and compare your results against the
-thresholds in `tests/thresholds.py`. They cost money.
+thresholds in `tests/thresholds.py`. They cost money. These thresholds were
+calibrated with the original course models, not DeepSeek; they are retained
+as reference targets and have not yet been validated for this edition.
 
 ```sh
 uv run pytest -m live -s                          # all live tests
@@ -108,10 +123,24 @@ All model calls go through `cs329z_hw1.llm.LM`: a list of
 ```python
 from cs329z_hw1.llm import LM
 
-lm = LM()            # the grading model, openai/gpt-6-luna
-judge = LM("judge")  # the evaluation's judge model, openai/gpt-6-sol
+lm = LM()            # the grading model, deepseek-flash
+judge = LM("judge")  # the evaluation's judge model, deepseek-v4-pro
 text = lm([{"role": "user", "content": "Say hello."}])
 ```
+
+Calls go directly to DeepSeek through the existing OpenAI-compatible SDK:
+
+| Role | Default model | Purpose |
+| --- | --- | --- |
+| `grading` (`LM()`) | `deepseek-flash` | Student agent and pipelines |
+| `user` | `deepseek-flash` | Simulated users |
+| `judge` | `deepseek-v4-pro` | Transcript evaluation |
+
+Override roles with `CS329Z_GRADING_MODEL`, `CS329Z_USER_MODEL`, and
+`CS329Z_JUDGE_MODEL` in `.env`. Use model IDs without a provider prefix.
+The wrapper disables thinking mode explicitly for every role. It continues
+to expose only text completions: students implement the tool protocol and
+structured response parsing themselves.
 
 The wrapper does three things:
 
@@ -119,7 +148,7 @@ The wrapper does three things:
   the sampling settings and the exact messages. Repeating an identical call
   returns the stored reply and costs nothing.
 - **Ledger.** Each call that reaches the provider is appended to
-  `.lm_cache/ledger.jsonl` with its token counts and cost. Print the totals
+  `.lm_cache/ledger.jsonl` with its token counts and estimated USD cost. Print the totals
   by model and by tag (the test suite tags each call with the test name)
   with:
 
@@ -127,12 +156,26 @@ The wrapper does three things:
   uv run python -m cs329z_hw1.llm
   ```
 
-- **Budget.** The key we issue you has a spending limit on our side, and
-  calls fail once it is reached. `CS329Z_BUDGET_USD` (in `.env` or the
-  environment) is a second limit you set for yourself: once the ledger
-  total reaches it, the wrapper raises `BudgetExceeded` instead of making
-  a call, so a runaway loop stops before the key does. Cached replies are
-  still returned.
+- **Budget.** `CS329Z_BUDGET_USD` (in `.env` or the environment) is a
+  local limit: once recorded spending reaches it, the wrapper refuses new
+  calls. Cached replies are still returned. This check happens before a
+  request; a request already in progress can cross the limit. Your DeepSeek
+  account balance is managed separately by the provider.
+
+Costs use the published **peak** USD rates, checked on 2026-11-12, including
+DeepSeek's reported cache-hit tokens. Off-peak billing is cheaper, so the
+ledger is a conservative estimate, not an exact invoice. See the
+[official pricing](https://api-docs.deepseek.com/quick_start/pricing/).
+Model prices are kept in `PRICES` in `llm.py`; an unknown model is rejected
+before a paid call. The local response cache includes the API endpoint and
+thinking mode in its key.
+
+To run only the model-wrapper checks without network calls or assignment
+solutions:
+
+```sh
+uv run pytest tests/test_llm.py
+```
 
 Deleting `.lm_cache/` deletes both the cache and the ledger.
 
